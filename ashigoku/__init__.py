@@ -1,13 +1,16 @@
 import asyncio
 import io
+import os
 import shutil
 import tempfile
 import traceback
 import zipfile
+from enum import Enum
 from fractions import Fraction
 from functools import wraps
 from pathlib import Path
 from typing import AsyncGenerator
+from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Tuple
@@ -20,6 +23,23 @@ from aiostream import stream
 FramesType = Dict[str, int]
 
 app = typer.Typer()
+
+ffmpeg_sema = asyncio.Semaphore(os.cpu_count())
+
+
+class OutFormat(Enum):
+    GIF = "gif"
+    WEBM = "webm"
+
+    @property
+    def create_subprocess(self) -> Callable[[Path, str], asyncio.subprocess.Process]:
+        return {
+            self.GIF: create_ffmpeg_subprocess,
+            self.WEBM: create_ffmpeg_webm_subprocess,
+        }[self]
+
+    def make_filename(self, illust_id: int):
+        return f"{illust_id}.{self.value}"
 
 
 def run_coro(f):
@@ -60,7 +80,8 @@ async def copyfileobj(fsrc, fdst, length=0):
 
 
 async def create_ffmpeg_subprocess(
-    directory: Path, fps: str,
+    directory: Path,
+    fps: str,
 ) -> asyncio.subprocess.Process:
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
@@ -75,6 +96,32 @@ async def create_ffmpeg_subprocess(
         fps,
         "-f",
         "gif",
+        "out",
+        cwd=directory,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    return process
+
+
+async def create_ffmpeg_webm_subprocess(
+    directory: Path,
+    fps: str,
+) -> asyncio.subprocess.Process:
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        "ffconcat.txt",
+        "-c:v",
+        "libvpx-vp9",
+        "-lossless",
+        "1",
+        "-r",
+        fps,
+        "-f",
+        "webm",
         "out",
         cwd=directory,
         stdout=asyncio.subprocess.DEVNULL,
@@ -149,21 +196,25 @@ async def unpack_zip(content: bytes, directory: Path) -> None:
 
 
 async def process_illust(
-    client: httpx.AsyncClient, illust_id: int, out_dir: Path
+    client: httpx.AsyncClient, format: OutFormat, illust_id: int, out_dir: Path
 ) -> None:
     zf, frames = await download_zip(client, illust_id)
 
     with tempfile.TemporaryDirectory(dir=out_dir) as directory:
         directory = Path(directory)
         await asyncio.gather(
-            create_ffconcat_file(directory, frames), unpack_zip(zf, directory),
+            create_ffconcat_file(directory, frames),
+            unpack_zip(zf, directory),
         )
         fps = get_fps(frames)
-        ff = await create_ffmpeg_subprocess(directory, fps)
-        ff_code = await ff.wait()
+        async with ffmpeg_sema:
+            ff = await format.create_subprocess(directory, fps)
+            ff_code = await ff.wait()
         if ff_code == 0:
+            out_fn = format.make_filename(illust_id)
             shutil.move(
-                directory.joinpath("out"), out_dir.joinpath(f"{illust_id}.gif"),
+                directory.joinpath("out"),
+                out_dir.joinpath(out_fn),
             )
         else:
             raise RuntimeError(f"ffmpeg exited with non-zero status {ff_code}")
@@ -173,6 +224,7 @@ async def process_illust(
 @run_coro
 async def main(
     out_dir: Path,
+    format: OutFormat = typer.Option(OutFormat.GIF, "--format", "-f"),
     artist_ids: List[int] = typer.Option(list, "--artist-id", "-a"),
     illust_ids: List[int] = typer.Option(list, "--illust-id", "-i"),
 ) -> None:
@@ -187,7 +239,9 @@ async def main(
         tasks = []
         async with illust_ids.stream() as illust_ids:
             async for illust_id in illust_ids:
-                task = asyncio.create_task(process_illust(client, illust_id, out_dir))
+                task = asyncio.create_task(
+                    process_illust(client, format, illust_id, out_dir)
+                )
                 tasks.append((illust_id, task))
                 typer.echo(f"Started processing {illust_id}")
 
@@ -196,7 +250,10 @@ async def main(
                 await task
             except Exception:
                 typer.echo(
-                    f"Could not fetch {illust_id}:\n{traceback.format_exc()}", err=True,
+                    f"Could not fetch {illust_id}:\n{traceback.format_exc()}",
+                    err=True,
                 )
             else:
-                typer.echo(f"Finished processing {illust_id}",)
+                typer.echo(
+                    f"Finished processing {illust_id}",
+                )

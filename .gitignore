@@ -5,7 +5,6 @@ __pycache__/
 
 # Distribution / packaging
 *.egg-info/
-poetry.lock
 
 # Unit test / coverage reports
 .pytest_cache/
