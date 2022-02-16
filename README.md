@@ -1,3 +1,7 @@
+# This tools has been RiiR'd
+
+Go see [ugokuna](https://github.com/hdk5/ugokuna)
+
 # `ashigoku`
 
 Shit I use to download ugoira illustrations from pixiv as gifs.
